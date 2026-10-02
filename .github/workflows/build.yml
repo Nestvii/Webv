@@ -1,0 +1,427 @@
+name: WebV Build
+
+run-name: WebV ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job identifier
+        required: true
+        type: string
+      app_name:
+        description: Application name
+        required: true
+        type: string
+      mode:
+        description: link or zip
+        required: true
+        type: string
+      url:
+        description: Target URL (link mode)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      MODE: ${{ inputs.mode }}
+      START_URL: ${{ inputs.url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$JOB_ID" =~ ^[a-f0-9]{10}$ ]] || { echo "Invalid job id"; exit 1; }
+          [[ "$MODE" == "link" || "$MODE" == "zip" ]] || { echo "Invalid mode"; exit 1; }
+          [ "${#APP_NAME}" -le 60 ] || { echo "App name too long"; exit 1; }
+          ls jobs/"$JOB_ID"/icon.* > /dev/null
+          if [ "$MODE" = "link" ]; then
+            [[ "$START_URL" =~ ^https?://[^[:space:]]+$ ]] || { echo "Invalid url"; exit 1; }
+          else
+            test -f "jobs/$JOB_ID/site.zip"
+          fi
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then SDKM="$(command -v sdkmanager)"; fi
+          yes | "$SDKM" --sdk_root="$ANDROID_HOME" --licenses > /dev/null || true
+          "$SDKM" --sdk_root="$ANDROID_HOME" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Prepare web source
+        if: ${{ inputs.mode == 'zip' }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          import sys
+          import zipfile
+
+          MAX_TOTAL = 400 * 1024 * 1024
+          MAX_ENTRIES = 10000
+          JUNK = {'.ds_store', 'thumbs.db', 'desktop.ini'}
+
+          job = os.environ['JOB_ID']
+          source = f'jobs/{job}/site.zip'
+          site = 'build_input/site'
+          os.makedirs(site, exist_ok=True)
+
+          total = 0
+          with zipfile.ZipFile(source) as archive:
+              infos = archive.infolist()
+              if len(infos) > MAX_ENTRIES:
+                  sys.exit('Too many entries in archive')
+              for info in infos:
+                  name = info.filename.replace('\\', '/')
+                  if info.is_dir() or name.endswith('/'):
+                      continue
+                  parts = [p for p in name.split('/') if p not in ('', '.')]
+                  if not parts or '..' in parts:
+                      sys.exit('Unsafe path in archive')
+                  if '__MACOSX' in parts or parts[-1].lower() in JUNK:
+                      continue
+                  if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                      continue
+                  target = os.path.join(site, *parts)
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with archive.open(info) as reader, open(target, 'wb') as writer:
+                      while True:
+                          chunk = reader.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          total += len(chunk)
+                          if total > MAX_TOTAL:
+                              sys.exit('Archive is too large after extraction')
+                          writer.write(chunk)
+
+          candidates = []
+          for directory, _, files in os.walk(site):
+              if 'index.html' in files:
+                  relative = os.path.relpath(directory, site)
+                  depth = 0 if relative == '.' else relative.count(os.sep) + 1
+                  candidates.append((depth, len(relative), relative))
+          if not candidates:
+              sys.exit('index.html not found')
+          candidates.sort()
+          if len([c for c in candidates if c[0] == candidates[0][0]]) > 1:
+              sys.exit('Multiple index.html files at the same level')
+          root = site if candidates[0][2] == '.' else os.path.join(site, candidates[0][2])
+          shutil.copytree(root, 'build_input/www')
+          print('Web root:', candidates[0][2])
+          PY
+
+      - name: Generate Android project
+        run: |
+          set -euo pipefail
+          APP_ID="com.webv.app${JOB_ID}"
+          echo "APP_ID=$APP_ID" >> "$GITHUB_ENV"
+
+          mkdir -p android/app/src/main/java/com/webv/app
+          mkdir -p android/app/src/main/res/values
+          mkdir -p android/app/src/main/assets
+
+          cat > android/settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'WebV'
+          include ':app'
+          EOF
+
+          cat > android/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > android/gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          EOF
+
+          cat > android/app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace = 'com.webv.app'
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = System.getenv('APP_ID')
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = '1.0'
+              }
+
+              signingConfigs {
+                  release {
+                      storeFile = file(System.getenv('KS_PATH'))
+                      storePassword = System.getenv('KS_PASS')
+                      keyAlias = 'webv'
+                      keyPassword = System.getenv('KS_PASS')
+                  }
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled = false
+                      signingConfig = signingConfigs.release
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              androidResources {
+                  ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
+              }
+
+              lint {
+                  checkReleaseBuilds = false
+                  abortOnError = false
+              }
+          }
+
+          dependencies {
+              implementation 'androidx.webkit:webkit:1.11.0'
+          }
+          EOF
+
+          cat > android/app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@mipmap/ic_launcher"
+                  android:allowBackup="false"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout|uiMode">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > android/app/src/main/java/com/webv/app/MainActivity.java <<'EOF'
+          package com.webv.app;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+          import android.webkit.CookieManager;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebResourceResponse;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import androidx.webkit.WebViewAssetLoader;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+
+          public class MainActivity extends Activity {
+
+              private WebView webView;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  final WebViewAssetLoader assetLoader = new WebViewAssetLoader.Builder()
+                          .addPathHandler("/assets/", new WebViewAssetLoader.AssetsPathHandler(this))
+                          .build();
+
+                  webView = new WebView(this);
+                  setContentView(webView);
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true);
+                  settings.setAllowFileAccess(false);
+                  settings.setAllowContentAccess(false);
+                  settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+
+                  CookieManager cookies = CookieManager.getInstance();
+                  cookies.setAcceptCookie(true);
+                  cookies.setAcceptThirdPartyCookies(webView, true);
+
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
+                          return assetLoader.shouldInterceptRequest(request.getUrl());
+                      }
+
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          Uri uri = request.getUrl();
+                          String scheme = uri.getScheme();
+                          if ("http".equals(scheme) || "https".equals(scheme)) {
+                              return false;
+                          }
+                          try {
+                              startActivity(new Intent(Intent.ACTION_VIEW, uri));
+                          } catch (Exception ignored) {
+                          }
+                          return true;
+                      }
+                  });
+
+                  webView.loadUrl(readStartUrl());
+              }
+
+              private String readStartUrl() {
+                  try (InputStream in = getAssets().open("start_url.txt")) {
+                      ByteArrayOutputStream out = new ByteArrayOutputStream();
+                      byte[] buffer = new byte[1024];
+                      int count;
+                      while ((count = in.read(buffer)) != -1) {
+                          out.write(buffer, 0, count);
+                      }
+                      return out.toString("UTF-8").trim();
+                  } catch (Exception e) {
+                      return "about:blank";
+                  }
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (webView != null && webView.canGoBack()) {
+                      webView.goBack();
+                  } else {
+                      super.onBackPressed();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (webView != null) {
+                      webView.destroy();
+                  }
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+          python3 - <<'PY'
+          import os
+          from xml.sax.saxutils import escape
+
+          name = os.environ['APP_NAME']
+          label = escape(name).replace("'", "\\'").replace('"', '\\"')
+          with open('android/app/src/main/res/values/strings.xml', 'w', encoding='utf-8') as f:
+              f.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n')
+              f.write(f'    <string name="app_name">{label}</string>\n</resources>\n')
+
+          if os.environ['MODE'] == 'zip':
+              start = 'https://appassets.androidplatform.net/assets/www/index.html'
+          else:
+              start = os.environ['START_URL']
+          with open('android/app/src/main/assets/start_url.txt', 'w', encoding='utf-8') as f:
+              f.write(start)
+          PY
+
+          if [ "$MODE" = "zip" ]; then
+            cp -r build_input/www android/app/src/main/assets/www
+            test -f android/app/src/main/assets/www/index.html
+          fi
+
+      - name: Generate icons
+        run: |
+          set -euo pipefail
+          ICON="$(ls jobs/"$JOB_ID"/icon.* | head -n 1)"
+          case "${ICON##*.}" in
+            png) FMT=PNG ;;
+            jpg) FMT=JPEG ;;
+            webp) FMT=WEBP ;;
+            *) echo "Unsupported icon format"; exit 1 ;;
+          esac
+          command -v convert > /dev/null || sudo apt-get install -y imagemagick
+          for spec in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            density="${spec%%:*}"
+            size="${spec##*:}"
+            out="android/app/src/main/res/mipmap-$density"
+            mkdir -p "$out"
+            convert "$FMT:$ICON[0]" -background none -resize "${size}x${size}^" -gravity center -extent "${size}x${size}" "PNG32:$out/ic_launcher.png"
+          done
+
+      - name: Create signing key
+        run: |
+          set -euo pipefail
+          KS_PASS="$(openssl rand -hex 16)"
+          echo "::add-mask::$KS_PASS"
+          echo "KS_PASS=$KS_PASS" >> "$GITHUB_ENV"
+          echo "KS_PATH=$RUNNER_TEMP/webv.jks" >> "$GITHUB_ENV"
+          keytool -genkeypair -keystore "$RUNNER_TEMP/webv.jks" -alias webv \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass "$KS_PASS" -keypass "$KS_PASS" \
+            -dname "CN=WebV, O=WebV, C=ID"
+
+      - name: Build APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          gradle --no-daemon --console=plain assembleRelease
+          mkdir -p ../out
+          cp app/build/outputs/apk/release/app-release.apk ../out/app.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: out/app.apk
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          
