@@ -1,0 +1,308 @@
+name: WebV Flutter Build
+
+run-name: WebV Flutter ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Job identifier
+        required: true
+        type: string
+      app_name:
+        description: Application name
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      APP_NAME: ${{ inputs.app_name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          [[ "$JOB_ID" =~ ^[a-f0-9]{10}$ ]] || { echo "Invalid job id"; exit 1; }
+          [ "${#APP_NAME}" -le 60 ] || { echo "App name too long"; exit 1; }
+          ls jobs/"$JOB_ID"/icon.* > /dev/null
+          test -f "jobs/$JOB_ID/flutter.zip"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK components
+        run: |
+          set -euo pipefail
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKM" ]; then SDKM="$(command -v sdkmanager)"; fi
+          yes | "$SDKM" --sdk_root="$ANDROID_HOME" --licenses > /dev/null || true
+
+      - name: Prepare Flutter source
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import shutil
+          import sys
+          import zipfile
+
+          MAX_TOTAL = 600 * 1024 * 1024
+          MAX_ENTRIES = 30000
+          JUNK_NAMES = {'.ds_store', 'thumbs.db', 'desktop.ini'}
+          SKIP_DIRS = {'__macosx', 'build', '.dart_tool', '.git', '.idea', '.gradle', '.pub-cache'}
+
+          job = os.environ['JOB_ID']
+          source = f'jobs/{job}/flutter.zip'
+          site = 'flutter_input'
+          os.makedirs(site, exist_ok=True)
+
+          total = 0
+          with zipfile.ZipFile(source) as archive:
+              infos = archive.infolist()
+              if len(infos) > MAX_ENTRIES:
+                  sys.exit('Too many entries in archive')
+              for info in infos:
+                  name = info.filename.replace('\\', '/')
+                  if info.is_dir() or name.endswith('/'):
+                      continue
+                  parts = [p for p in name.split('/') if p not in ('', '.')]
+                  if not parts or '..' in parts:
+                      sys.exit('Unsafe path in archive')
+                  if any(p.lower() in SKIP_DIRS for p in parts[:-1]) or parts[-1].lower() in JUNK_NAMES:
+                      continue
+                  if ((info.external_attr >> 16) & 0o170000) == 0o120000:
+                      continue
+                  target = os.path.join(site, *parts)
+                  os.makedirs(os.path.dirname(target), exist_ok=True)
+                  with archive.open(info) as reader, open(target, 'wb') as writer:
+                      while True:
+                          chunk = reader.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          total += len(chunk)
+                          if total > MAX_TOTAL:
+                              sys.exit('Archive is too large after extraction')
+                          writer.write(chunk)
+
+          candidates = []
+          for directory, _, files in os.walk(site):
+              if 'pubspec.yaml' in files:
+                  relative = os.path.relpath(directory, site)
+                  depth = 0 if relative == '.' else relative.count(os.sep) + 1
+                  candidates.append((depth, relative))
+          if not candidates:
+              sys.exit('pubspec.yaml not found')
+          candidates.sort()
+          if len([c for c in candidates if c[0] == candidates[0][0]]) > 1:
+              sys.exit('Multiple pubspec.yaml files at the same level')
+          root = site if candidates[0][1] == '.' else os.path.join(site, candidates[0][1])
+
+          with open(os.path.join(root, 'pubspec.yaml'), encoding='utf-8', errors='replace') as handle:
+              spec = handle.read()
+          if not re.search(r'^\s+sdk:\s*flutter\s*$', spec, re.M):
+              sys.exit('pubspec.yaml is not a Flutter project')
+          match = re.search(r'^name:\s*([A-Za-z0-9_]+)\s*$', spec, re.M)
+          pkg_name = match.group(1) if match else 'app'
+
+          shutil.copytree(root, 'flutter_app')
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as env:
+              env.write(f'FLUTTER_PROJECT={os.path.abspath("flutter_app")}\n')
+              env.write(f'PKG_NAME={pkg_name}\n')
+          print('Flutter root:', candidates[0][1])
+          PY
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Ensure Android platform
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            echo "Folder android tidak ada, membuat platform Android."
+            flutter create --platforms=android --project-name "$PKG_NAME" .
+          fi
+
+      - name: Patch build tools
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        run: |
+          set -euo pipefail
+          MIN_AGP="8.12.1"
+          MIN_KOTLIN="2.2.20"
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+          Q="[\"']"
+          SP="[[:space:]]*"
+
+          # Flutter terbaru butuh Gradle minimal 8.14.0
+          if [ -f "$WRAPPER" ]; then
+            sed -i -E 's#distributionUrl=.*#distributionUrl=https\\://services.gradle.org/distributions/gradle-8.14.2-all.zip#' "$WRAPPER"
+          fi
+
+          for FILE in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts; do
+            [ -f "$FILE" ] || continue
+            # Android Gradle Plugin (id "..." version "x" atau id("...") version "x")
+            sed -i -E "s#(id${SP}\(?${SP}${Q}com\.android\.application${Q}${SP}\)?${SP}version${SP}${Q})[0-9][0-9.]*(${Q})#\1${MIN_AGP}\2#" "$FILE"
+            sed -i -E "s#(id${SP}\(?${SP}${Q}com\.android\.library${Q}${SP}\)?${SP}version${SP}${Q})[0-9][0-9.]*(${Q})#\1${MIN_AGP}\2#" "$FILE"
+            sed -i -E "s#(classpath${SP}\(?${SP}${Q}com\.android\.tools\.build:gradle:)[0-9][0-9.]*(${Q})#\1${MIN_AGP}\2#" "$FILE"
+            # Kotlin Gradle Plugin
+            sed -i -E "s#(id${SP}\(?${SP}${Q}org\.jetbrains\.kotlin\.android${Q}${SP}\)?${SP}version${SP}${Q})[0-9][0-9.]*(${Q})#\1${MIN_KOTLIN}\2#" "$FILE"
+            sed -i -E "s#(ext\.kotlin_version${SP}=${SP}${Q})[0-9][0-9.]*(${Q})#\1${MIN_KOTLIN}\2#" "$FILE"
+            sed -i -E "s#(classpath${SP}\(?${SP}${Q}org\.jetbrains\.kotlin:kotlin-gradle-plugin:)[0-9][0-9.]*(${Q})#\1${MIN_KOTLIN}\2#" "$FILE"
+          done
+
+          # Project yang memakai version catalog
+          if [ -f android/gradle/libs.versions.toml ]; then
+            sed -i -E "s#^(agp${SP}=${SP}\")[0-9][0-9.]*(\")#\1${MIN_AGP}\2#" android/gradle/libs.versions.toml
+            sed -i -E "s#^(kotlin${SP}=${SP}\")[0-9][0-9.]*(\")#\1${MIN_KOTLIN}\2#" android/gradle/libs.versions.toml
+          fi
+
+          echo "--- Hasil patch:"
+          grep -n "distributionUrl" "$WRAPPER" || true
+          grep -rnE "com\.android\.(application|tools\.build)|org\.jetbrains\.kotlin" android/settings.gradle* android/build.gradle* 2>/dev/null || true
+
+      - name: Apply app name and icon
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import re
+          from xml.sax.saxutils import quoteattr
+
+          path = 'android/app/src/main/AndroidManifest.xml'
+          with open(path, encoding='utf-8') as handle:
+              xml = handle.read()
+          label = quoteattr(os.environ['APP_NAME'])
+          xml, count = re.subn(r'android:label="[^"]*"', 'android:label=' + label, xml, count=1)
+          if count == 0:
+              xml = xml.replace('<application', '<application android:label=' + label, 1)
+          if 'android:icon=' in xml:
+              xml = re.sub(r'android:icon="[^"]*"', 'android:icon="@mipmap/ic_launcher"', xml, count=1)
+          else:
+              xml = xml.replace('<application', '<application android:icon="@mipmap/ic_launcher"', 1)
+          with open(path, 'w', encoding='utf-8') as handle:
+              handle.write(xml)
+          PY
+
+          ICON="$(ls "$GITHUB_WORKSPACE"/jobs/"$JOB_ID"/icon.* | head -n 1)"
+          case "${ICON##*.}" in
+            png) FMT=PNG ;;
+            jpg) FMT=JPEG ;;
+            webp) FMT=WEBP ;;
+            *) echo "Unsupported icon format"; exit 1 ;;
+          esac
+          command -v convert > /dev/null || sudo apt-get install -y imagemagick
+          RES=android/app/src/main/res
+          rm -f "$RES"/mipmap-anydpi*/ic_launcher*.xml
+          for spec in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+            density="${spec%%:*}"
+            size="${spec##*:}"
+            out="$RES/mipmap-$density"
+            mkdir -p "$out"
+            convert "$FMT:$ICON[0]" -background none -resize "${size}x${size}^" -gravity center -extent "${size}x${size}" "PNG32:$out/ic_launcher.png"
+          done
+
+      - name: Flutter dependencies
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Build Flutter APK
+        working-directory: ${{ env.FLUTTER_PROJECT }}
+        run: |
+          flutter build apk --release
+
+      - name: Collect Flutter APK
+        run: |
+          set -euo pipefail
+          DIR="$FLUTTER_PROJECT/build/app/outputs/flutter-apk"
+          mkdir -p out
+          APK="$DIR/app-release.apk"
+          if [ ! -f "$APK" ]; then
+            APK="$(find "$DIR" -type f -name '*.apk' -print -quit)"
+          fi
+          if [ -z "$APK" ] || [ ! -f "$APK" ]; then
+            echo "::error::APK Flutter tidak ditemukan."
+            exit 1
+          fi
+          cp "$APK" out/app.apk
+          ICON="$FLUTTER_PROJECT/android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png"
+          if [ -f "$ICON" ]; then cp "$ICON" out/icon.png; fi
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: |
+            out/app.apk
+            out/icon.png
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Job ini tidak menjalankan kode dari project user. Kegagalannya tidak menggagalkan build.
+    continue-on-error: true
+    permissions:
+      contents: write
+    env:
+      JOB_ID: ${{ inputs.job_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download APK
+        uses: actions/download-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: out
+
+      - name: Publish large APK
+        run: |
+          set -euo pipefail
+          THRESHOLD=20971520
+          SIZE="$(stat -c%s out/app.apk)"
+          if [ "$SIZE" -lt "$THRESHOLD" ]; then
+            echo "APK di bawah 20 MB, tidak dipublikasikan."
+            exit 0
+          fi
+          SAFE="$(printf '%s' "$APP_NAME" | tr -c 'A-Za-z0-9_-' '_' | cut -c1-40)"
+          [ -n "$SAFE" ] || SAFE="app"
+          cp out/app.apk "out/${SAFE}.apk"
+          HASH="$(sha256sum out/app.apk | cut -d' ' -f1)"
+          FILES=("out/${SAFE}.apk")
+          if [ -f out/icon.png ]; then FILES+=("out/icon.png"); fi
+          gh release create "apk-$JOB_ID" "${FILES[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$APP_NAME" \
+            --notes "sha256=$HASH"
+
+      - name: Clean old releases
+        continue-on-error: true
+        run: |
+          CUTOFF="$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)"
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName,createdAt \
+            --jq ".[] | select(.createdAt < \"$CUTOFF\") | select(.tagName | startswith(\"apk-\")) | .tagName" |
+          while read -r TAG; do
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done
