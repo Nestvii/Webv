@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#08090b">
+<title>WebV Download</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: #08090b;
+    --card: #0d0e11;
+    --line: rgba(255, 255, 255, 0.16);
+    --line-soft: rgba(255, 255, 255, 0.08);
+    --text: #f4f5f7;
+    --muted: #8b8f98;
+    --accent: #3ddc84;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
+  body {
+    font-family: 'Sora', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 24px 16px calc(64px + env(safe-area-inset-bottom));
+    background:
+      radial-gradient(120% 60% at 50% 0%, rgba(61, 220, 132, 0.07), transparent 60%),
+      var(--bg);
+  }
+  .stack { width: 100%; max-width: 460px; margin: 0 auto; display: grid; gap: 14px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--line);
+    border-radius: 24px;
+  }
+
+  .hero {
+    display: grid;
+    grid-template-columns: 112px 1fr;
+    gap: 18px;
+    align-items: center;
+    padding: 16px;
+    width: 100%;
+    font: inherit;
+    color: inherit;
+    text-align: center;
+    cursor: pointer;
+    transition: transform 0.15s ease, border-color 0.2s ease;
+  }
+  .hero:active { transform: scale(0.975); border-color: rgba(255, 255, 255, 0.4); }
+  .hero[disabled] { opacity: 0.5; pointer-events: none; }
+  .icon {
+    height: 138px;
+    border: 1px solid var(--line);
+    border-radius: 18px;
+    background: #050506;
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+  }
+  .icon svg { width: 62px; height: auto; fill: #fff; }
+  .icon img { width: 100%; height: 100%; object-fit: cover; display: none; }
+  .hero-title {
+    margin: 0;
+    font-size: 30px;
+    line-height: 1.12;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+  }
+  .hero-sub {
+    margin: 8px 0 0;
+    font-size: 11px;
+    font-weight: 400;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+
+  .details { padding: 20px 22px 22px; }
+  .details h2 {
+    margin: 0 0 14px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  dl { margin: 0; display: grid; gap: 0; }
+  .row {
+    display: grid;
+    grid-template-columns: 112px 1fr;
+    gap: 10px;
+    padding: 11px 0;
+    border-top: 1px solid var(--line-soft);
+    font-size: 14px;
+    align-items: baseline;
+  }
+  .row:first-child { border-top: 0; padding-top: 0; }
+  dt { color: var(--muted); font-weight: 400; }
+  dd { margin: 0; font-weight: 600; word-break: break-word; }
+  dd.mono { font-family: 'JetBrains Mono', ui-monospace, monospace; font-size: 12.5px; font-weight: 500; }
+  .copyable { cursor: pointer; }
+
+  .actions { display: flex; gap: 10px; margin-top: 18px; }
+  .ghost {
+    flex: 1;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    background: transparent;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 12px 10px;
+    cursor: pointer;
+  }
+  .ghost:active { background: rgba(255, 255, 255, 0.06); }
+
+  .notice { padding: 28px 22px; text-align: center; }
+  .notice h1 { margin: 0 0 10px; font-size: 22px; font-weight: 800; letter-spacing: -0.01em; }
+  .notice p { margin: 0; font-size: 14px; line-height: 1.6; color: var(--muted); }
+
+  .footer {
+    position: fixed;
+    left: 0; right: 0;
+    bottom: calc(18px + env(safe-area-inset-bottom));
+    text-align: center;
+    font-size: 11px;
+    letter-spacing: 0.16em;
+    color: #6a6e77;
+  }
+  .footer a { color: #9aa0ab; text-decoration: none; }
+
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: calc(56px + env(safe-area-inset-bottom));
+    transform: translate(-50%, 12px);
+    background: #f4f5f7;
+    color: #08090b;
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 9px 16px;
+    border-radius: 999px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease, transform 0.2s ease;
+  }
+  .toast.show { opacity: 1; transform: translate(-50%, 0); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main class="stack">
+  <section id="view-app" hidden>
+    <div class="stack">
+      <button id="download" class="card hero" type="button">
+        <div class="icon">
+          <img id="app-icon" alt="">
+          <svg id="android-logo" viewBox="0 0 64 74" aria-hidden="true">
+            <path d="M12 28a20 20 0 0 1 40 0z"/>
+            <rect x="12" y="31" width="40" height="26" rx="2"/>
+            <rect x="0" y="31" width="9" height="22" rx="4.5"/>
+            <rect x="55" y="31" width="9" height="22" rx="4.5"/>
+            <rect x="18" y="52" width="10" height="20" rx="5"/>
+            <rect x="36" y="52" width="10" height="20" rx="5"/>
+            <path d="M20 8l-4-6" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
+            <path d="M44 8l4-6" stroke="#fff" stroke-width="3" stroke-linecap="round" fill="none"/>
+            <circle cx="24" cy="19" r="2.4" fill="#0d0e11"/>
+            <circle cx="40" cy="19" r="2.4" fill="#0d0e11"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="hero-title" id="hero-title">Tap To<br>Downloads!</h1>
+          <p class="hero-sub" id="hero-sub">Android APK</p>
+        </div>
+      </button>
+
+      <section class="card details">
+        <h2>Details</h2>
+        <dl>
+          <div class="row"><dt>Project</dt><dd id="d-name">-</dd></div>
+          <div class="row"><dt>Ukuran</dt><dd id="d-size">-</dd></div>
+          <div class="row"><dt>Tipe</dt><dd id="d-type">-</dd></div>
+          <div class="row"><dt>Dibuat</dt><dd id="d-built">-</dd></div>
+          <div class="row"><dt>Berlaku s.d.</dt><dd id="d-exp">-</dd></div>
+          <div class="row" id="row-sha"><dt>SHA-256</dt><dd id="d-sha" class="mono copyable">-</dd></div>
+        </dl>
+        <div class="actions">
+          <button id="copy-link" class="ghost" type="button">Salin tautan</button>
+        </div>
+      </section>
+    </div>
+  </section>
+
+  <section id="view-notice" class="card notice" hidden>
+    <h1 id="n-title"></h1>
+    <p id="n-text"></p>
+  </section>
+</main>
+
+<div class="footer">Owners : <a id="owner-link" href="#">@IntDy5</a></div>
+<div class="toast" id="toast"></div>
+
+<script>
+(function () {
+  'use strict';
+
+  var OWNER_HANDLE = 'IntDy5';
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var $ = function (id) { return document.getElementById(id); };
+
+  function showNotice(title, text) {
+    $('view-app').hidden = true;
+    $('view-notice').hidden = false;
+    $('n-title').textContent = title;
+    $('n-text').textContent = text;
+  }
+
+  function decode(param) {
+    try {
+      var b64 = param.replace(/-/g, '+').replace(/_/g, '/');
+      b64 += '='.repeat((4 - (b64.length % 4)) % 4);
+      var bin = atob(b64);
+      var bytes = Uint8Array.from(bin, function (c) { return c.charCodeAt(0); });
+      return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function formatSize(bytes) {
+    return (bytes / 1048576).toFixed(2) + ' MB';
+  }
+
+  function formatDate(ms) {
+    try {
+      return new Intl.DateTimeFormat('id-ID', { timeZone: 'Asia/Jakarta', dateStyle: 'medium', timeStyle: 'short' }).format(new Date(ms)) + ' WIB';
+    } catch (e) {
+      return new Date(ms).toISOString();
+    }
+  }
+
+  function isReleaseUrl(value) {
+    return typeof value === 'string' && /^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/releases\/download\//.test(value);
+  }
+
+  function toast(text) {
+    var el = $('toast');
+    el.textContent = text;
+    el.classList.add('show');
+    clearTimeout(toast.timer);
+    toast.timer = setTimeout(function () { el.classList.remove('show'); }, 1800);
+  }
+
+  function copy(text, message) {
+    var done = function () { toast(message); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, done);
+    } else {
+      done();
+    }
+  }
+
+  function haptic(kind) {
+    try { tg.HapticFeedback.impactOccurred(kind || 'light'); } catch (e) { /* abaikan */ }
+  }
+
+  if (tg) {
+    try {
+      tg.ready();
+      tg.expand();
+      tg.setHeaderColor('#08090b');
+      tg.setBackgroundColor('#08090b');
+    } catch (e) { /* abaikan */ }
+  }
+
+  $('owner-link').addEventListener('click', function (event) {
+    event.preventDefault();
+    var link = 'https://t.me/' + OWNER_HANDLE;
+    if (tg && tg.openTelegramLink) tg.openTelegramLink(link);
+    else window.open(link, '_blank');
+  });
+
+  var param = new URLSearchParams(location.search).get('d');
+  var data = param ? decode(param) : null;
+
+  if (!data || typeof data.n !== 'string' || !isReleaseUrl(data.u) || !Number.isFinite(data.s) || !Number.isFinite(data.o)) {
+    showNotice('Tautan tidak valid', 'Halaman ini hanya dapat dibuka melalui tombol yang dikirim oleh bot setelah build selesai.');
+    return;
+  }
+
+  if (!tg || !tg.initData) {
+    showNotice('Buka melalui Telegram', 'Halaman ini hanya dapat dibuka dari dalam Telegram melalui tombol yang dikirim oleh bot.');
+    return;
+  }
+
+  var user = tg.initDataUnsafe && tg.initDataUnsafe.user;
+  if (!user || user.id !== data.o) {
+    showNotice('Akses ditolak', 'Halaman unduhan ini dibuat untuk akun lain dan tidak dapat dibuka dengan akun Anda.');
+    return;
+  }
+
+  if (data.x && Date.now() > data.x) {
+    showNotice('Tautan kedaluwarsa', 'File ini sudah dihapus dari server. Silakan lakukan build ulang melalui bot.');
+    return;
+  }
+
+  $('view-app').hidden = false;
+  $('d-name').textContent = data.n;
+  $('d-size').textContent = formatSize(data.s);
+  $('d-type').textContent = data.k || 'Android APK';
+  $('d-built').textContent = data.t ? formatDate(data.t) : '-';
+  $('d-exp').textContent = data.x ? formatDate(data.x) : '-';
+
+  if (data.h && /^[a-f0-9]{64}$/i.test(data.h)) {
+    $('d-sha').textContent = data.h.slice(0, 12) + '…' + data.h.slice(-6);
+    $('d-sha').addEventListener('click', function () {
+      haptic('light');
+      copy(data.h, 'SHA-256 disalin');
+    });
+  } else {
+    $('row-sha').hidden = true;
+  }
+
+  if (isReleaseUrl(data.i)) {
+    var img = $('app-icon');
+    img.onload = function () {
+      img.style.display = 'block';
+      $('android-logo').style.display = 'none';
+    };
+    img.src = data.i;
+  }
+
+  $('download').addEventListener('click', function () {
+    haptic('medium');
+    $('hero-sub').textContent = 'Membuka unduhan';
+    try {
+      if (tg.openLink) tg.openLink(data.u);
+      else window.open(data.u, '_blank');
+    } catch (e) {
+      window.open(data.u, '_blank');
+    }
+    setTimeout(function () { $('hero-sub').textContent = 'Android APK'; }, 2500);
+  });
+
+  $('copy-link').addEventListener('click', function () {
+    haptic('light');
+    copy(data.u, 'Tautan disalin');
+  });
+})();
+</script>
+</body>
+</html>
